@@ -18,6 +18,8 @@ export PATH="$WORK/bin:$PATH"
 printf 'x' > "$WORK/notes.txt"
 printf 'x' > "$WORK/pic.png"
 printf 'x' > "$WORK/exists.jpg"
+printf 'not an image' > "$WORK/evil.txt"
+printf 'x' > "$WORK/evil.txt;x.png"
 
 pass=0; fail=0
 # expect_refusal NAME EXPECTED_STDERR_SUBSTRING [env KEY=VAL ...] -- ARGS...
@@ -38,6 +40,7 @@ K=DESIGNERBOX_API_KEY=apikey_00000000-0000-0000-0000-000000000000
 NOKEY=DESIGNERBOX_API_KEY=
 
 expect_refusal "missing key"                 "set DESIGNERBOX_API_KEY"   "$NOKEY" -- usage
+expect_refusal "key with header injection"  "does not look like"       "DESIGNERBOX_API_KEY=$(printf 'apikey_x\nX-Evil: 1')" -- usage
 expect_refusal "unknown command"             "unknown command"           "$K" -- frobnicate
 expect_refusal "asset id path traversal"     "invalid asset id"          "$K" -- asset ../../users
 expect_refusal "asset id with query"         "invalid asset id"          "$K" -- asset "6a632e774973bcb3a23d6c3e?x=1"
@@ -47,8 +50,11 @@ expect_refusal "download bad id"             "invalid asset id"          "$K" --
 expect_refusal "download no overwrite"       "refusing to overwrite"     "$K" -- download 6a632e774973bcb3a23d6c3e exists.jpg
 expect_refusal "assets limit over 100"       "--limit must be"           "$K" -- assets --limit 101
 expect_refusal "assets page not int"         "--page must be"            "$K" -- assets --page 1abc
+expect_refusal "assets page leading zero"    "--page must be"            "$K" -- assets videos --page 08
 expect_refusal "assets unknown flag"         "unknown flag"              "$K" -- assets --folder x
 expect_refusal "upload non-media"            "only image and video"      "$K" -- upload notes.txt
+expect_refusal "upload ; in name (curl -F)"  "rename it without"        "$K" -- upload "evil.txt;x.png"
+expect_refusal "edit ref ; in name"          "rename it without"         "$K" -- edit --prompt hi --ref "evil.txt;x.png"
 expect_refusal "upload missing file"         "no such file"              "$K" -- upload missing.png
 expect_refusal "upload-url http"             "refusing non-https"        "$K" -- upload-url http://example.com/a.png
 expect_refusal "upload-url file scheme"      "refusing non-https"        "$K" -- upload-url file:///etc/passwd
@@ -65,6 +71,13 @@ expect_refusal "edit non-image file ref"     "only image files"          "$K" --
 expect_refusal "edit bad mode"               "invalid value"             "$K" -- edit --prompt hi --ref pic.png --mode "x y"
 expect_refusal "edit 11 refs"                "at most 10"                "$K" -- edit --prompt hi $(for i in 1 2 3 4 5 6 7 8 9 10 11; do printf -- '--ref pic.png '; done)
 expect_refusal "edit good+bad ref, no upload" "--ref must be"            "$K" -- edit --prompt hi --ref pic.png --ref nope
+
+# the key must never be a curl argument (argv is visible to every local user via ps)
+: > "$CURL_LOG"
+(cd "$WORK" && env "$K" bash "$DBX" usage >/dev/null 2>&1)
+if [ -s "$CURL_LOG" ] && ! grep -q "apikey_00000000" "$CURL_LOG" && grep -q -- "-H @-" "$CURL_LOG"; then
+  pass=$((pass+1)); echo "ok   key not in curl argv"
+else fail=$((fail+1)); echo "FAIL key not in curl argv: $(cat "$CURL_LOG")"; fi
 
 # base URL is hardcoded: no env var can redirect the key to another host
 if grep -nE 'BASE=.*\$' "$DBX" >/dev/null; then fail=$((fail+1)); echo "FAIL base URL is overridable"; else pass=$((pass+1)); echo "ok   base URL hardcoded"; fi

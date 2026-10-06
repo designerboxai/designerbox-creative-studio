@@ -24,7 +24,7 @@ valid_asset_id() { [[ "$1" =~ ^[0-9a-f]{24}$ ]] || die "invalid asset id: $1 (ex
 # valid_token VALUE -> dies unless VALUE is a plain token (model ids, edit modes)
 valid_token() { case "$1" in ''|*[!A-Za-z0-9._-]*) die "invalid value: $1";; esac; }
 # valid_int VALUE MIN MAX NAME
-valid_int() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge "$2" ] && [ "$1" -le "$3" ] || die "$4 must be an integer from $2 to $3 (got: $1)"; }
+valid_int() { [[ "$1" =~ ^(0|[1-9][0-9]{0,8})$ ]] && [ "$1" -ge "$2" ] && [ "$1" -le "$3" ] || die "$4 must be an integer from $2 to $3 (got: $1)"; }
 # valid_https VALUE
 valid_https() { case "$1" in https://*) ;; *) die "refusing non-https URL: $1";; esac; }
 
@@ -36,7 +36,13 @@ mime_for() {
   esac
 }
 
-require_key() { [ -n "${DESIGNERBOX_API_KEY:-}" ] || die "set DESIGNERBOX_API_KEY (create one at https://designerbox.ai/account/api-keys)"; }
+require_key() {
+  [ -n "${DESIGNERBOX_API_KEY:-}" ] || die "set DESIGNERBOX_API_KEY (create one at https://designerbox.ai/account/api-keys)"
+  [[ "$DESIGNERBOX_API_KEY" =~ ^apikey_[A-Za-z0-9-]+$ ]] || die "DESIGNERBOX_API_KEY does not look like a DesignerBox key (apikey_...)"
+}
+
+# kcurl ARGS... -> curl with the key header fed on stdin, so the key never appears in the process list
+kcurl() { curl -H @- "$@" <<<"x-api-key: $DESIGNERBOX_API_KEY"; }
 
 # api METHOD PATH [json-body]  -> stdout: body; on HTTP>=400 prints a human error and exits 1
 api() {
@@ -44,11 +50,10 @@ api() {
   local tmp code
   tmp="$(mktemp)"
   if [ -n "$body" ]; then
-    code="$(curl -sS -o "$tmp" -w '%{http_code}' -X "$method" "$BASE$path" \
-      -H "x-api-key: $DESIGNERBOX_API_KEY" -H 'Content-Type: application/json' -d "$body")" || { rm -f "$tmp"; die "request failed: $method $path"; }
+    code="$(kcurl -sS -o "$tmp" -w '%{http_code}' -X "$method" "$BASE$path" \
+      -H 'Content-Type: application/json' -d "$body")" || { rm -f "$tmp"; die "request failed: $method $path"; }
   else
-    code="$(curl -sS -o "$tmp" -w '%{http_code}' -X "$method" "$BASE$path" \
-      -H "x-api-key: $DESIGNERBOX_API_KEY")" || { rm -f "$tmp"; die "request failed: $method $path"; }
+    code="$(kcurl -sS -o "$tmp" -w '%{http_code}' -X "$method" "$BASE$path")" || { rm -f "$tmp"; die "request failed: $method $path"; }
   fi
   check_status "$code" "$tmp"
   cat "$tmp"; rm -f "$tmp"
@@ -163,11 +168,13 @@ cmd_upload() {
   [ -f "$file" ] || die "no such file: $file"
   local mime; mime="$(mime_for "$file")"
   [ -n "$mime" ] || die "refusing to upload '$file': only image and video files (jpg jpeg png webp gif mp4 webm mov)"
+  # curl -F splits its value on ; and reads quotes/backslashes, so "a.txt;x.png" would upload a.txt
+  case "$file" in *[\;,\"\\]*|*$'\n'*|*$'\r'*) die "refusing to upload '$file': rename it without ; , \" or \\ characters";; esac
   require_key
   local tmp code
   tmp="$(mktemp)"
-  code="$(curl -sS -o "$tmp" -w '%{http_code}' -X POST "$BASE/assets/upload/single" \
-    -H "x-api-key: $DESIGNERBOX_API_KEY" -F "file=@$file;type=$mime")" || { rm -f "$tmp"; die "upload request failed"; }
+  code="$(kcurl -sS -o "$tmp" -w '%{http_code}' -X POST "$BASE/assets/upload/single" \
+    -F "file=@$file;type=$mime")" || { rm -f "$tmp"; die "upload request failed"; }
   check_status "$code" "$tmp"
   jq '.asset | {id: ._id, url: .viewUrl}' "$tmp"; rm -f "$tmp"
 }
