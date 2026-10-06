@@ -1,10 +1,11 @@
 ---
 name: designerbox-creative-studio
 version: 0.1.0
-description: Generate and edit images with DesignerBox AI and manage the user's DesignerBox asset library through the DesignerBox REST API. Use when the user wants to create an image from a prompt, edit or restyle an existing image (background swap, style transfer, object removal, outpaint, product shots), check AI credit usage or model prices, or list, inspect, download or upload images and videos in their DesignerBox library, and has a paid DesignerBox account and API key.
+description: Generate and edit images with DesignerBox AI and manage the user's DesignerBox asset library through the DesignerBox REST API. Use when the user wants to create an image from a prompt, edit or restyle an existing image (background swap, style transfer, object removal, outpaint, product shots), check AI credit usage or model prices, or list, inspect, download or upload images and videos in their DesignerBox library, and has a paid DesignerBox account and API key. Generating, editing and uploading always preview first and need the user's approval; generating and editing spend AI credits.
+allowed-tools: Bash(./designerbox:*), Bash(curl:*), Bash(jq:*), Read
 metadata:
   requires:
-    bins: [curl, jq]
+    bins: [bash, curl, jq]
     env: [DESIGNERBOX_API_KEY]
 ---
 
@@ -29,11 +30,13 @@ Two ways to use this skill:
 3. **Edit** an existing image: `./designerbox edit --prompt "..." --ref <assetId|https-url|image-file> [--mode bgswap]`. A local image file is uploaded to the library first.
 4. **Use the result**: `./designerbox asset <id>` for details, `./designerbox download <id> out.jpg` to save it locally.
 
+`generate`, `edit`, `upload` and `upload-url` first print a **preview and send nothing** (exit code 3). Show the preview to the user, with the cost for generate/edit (`creditsPerImage` x count from `./designerbox models`). Only after they approve it, run the identical command again with `--confirm <code>` from the preview. The code covers that exact operation: if the prompt, model, count, references or file change, preview again and get a fresh approval.
+
 Every generated or edited image is saved to the user's library automatically.
 
 ## Safety
 
-- **Generation and editing spend real AI credits** on the user's account. Before every `generate` or `edit`, tell the user the model, the image count and the cost (`creditsPerImage` x count from `./designerbox models`) and get a yes.
+- **Generation and editing spend real AI credits** on the user's account. Before every `generate` or `edit`, tell the user the model, the image count and the cost (`creditsPerImage` x count from `./designerbox models`) and get a yes. The helper enforces this: without the `--confirm` code from its own preview it sends nothing. Never pass a code the user has not approved, and never reuse one for a changed operation.
 - **Uploads add files to the user's library and use storage.** Upload only files the user asked to add. A local file passed to `edit --ref` is uploaded to the library first and stays there, even if the edit then fails. The helper accepts images and video only, and `upload-url` and edit references must be https.
 - The API key acts on the user's real account. Use a dedicated key, and never paste it into prompts, logs, URLs or files.
 - The helper sends the key only to `https://api-app.designerbox.ai`. `download` fetches the asset's public https `viewUrl` without the key. Do not send the key to any other host.

@@ -1,6 +1,6 @@
 # Assets
 
-> Safety: upload only files the user asked to add (images and video). Uploads count against storage. Use a dedicated API key and never echo it.
+> Safety: upload only files the user asked to add (images and video), after they approve the exact file. Uploads count against storage. The `designerbox` helper previews each upload and needs its `--confirm` code; with raw curl it is on you. Use a dedicated API key and never echo it.
 
 ```bash
 BASE=https://api-app.designerbox.ai/api/v1

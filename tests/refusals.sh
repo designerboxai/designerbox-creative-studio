@@ -38,7 +38,7 @@ expect_refusal() {
     fail=$((fail+1)); printf 'FAIL %s (rc=%s, curl calls=%s)\n     stderr: %s\n' "$name" "$rc" "$(wc -l < "$CURL_LOG" | tr -d ' ')" "$err"
   fi
 }
-K=DESIGNERBOX_API_KEY=apikey_00000000-0000-0000-0000-000000000000
+K=DESIGNERBOX_API_KEY=apikey_dummy-not-a-key
 NOKEY=DESIGNERBOX_API_KEY=
 
 expect_refusal "missing key"                 "set DESIGNERBOX_API_KEY"   "$NOKEY" -- usage
@@ -80,7 +80,7 @@ expect_refusal "edit good+bad ref, no upload" "--ref must be"            "$K" --
 # the key must never be a curl argument (argv is visible to every local user via ps)
 : > "$CURL_LOG"
 (cd "$WORK" && env "$K" "${DBX_BASH:-bash}" "$DBX" usage >/dev/null 2>&1)
-if [ -s "$CURL_LOG" ] && ! grep -q "apikey_00000000" "$CURL_LOG" && grep -q -- "-H @-" "$CURL_LOG"; then
+if [ -s "$CURL_LOG" ] && ! grep -q "apikey_dummy-not-a-key" "$CURL_LOG" && grep -q -- "-H @-" "$CURL_LOG"; then
   pass=$((pass+1)); echo "ok   key not in curl argv"
 else fail=$((fail+1)); echo "FAIL key not in curl argv: $(cat "$CURL_LOG")"; fi
 

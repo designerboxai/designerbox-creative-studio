@@ -45,6 +45,29 @@ require_key() {
 # -q (must be first) skips ~/.curlrc, where "verbose" would print the key and "location-trusted" would forward it.
 kcurl() { curl -q -H @- "$@" <<<"x-api-key: $DESIGNERBOX_API_KEY"; }
 
+# ---- confirmation gate -------------------------------------------------------
+# Every command that spends credits or adds files (generate, edit, upload,
+# upload-url) first prints a PREVIEW and sends nothing. It runs only when called
+# again with --confirm <code>, where <code> is a hash of that exact operation:
+# change the prompt, model, count, references or file and the old code no longer matches.
+sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi | cut -d' ' -f1; }
+
+# gate DESCRIPTION_JSON CONFIRM -> returns only when CONFIRM matches; otherwise previews and exits 3
+gate() {
+  local desc code
+  desc="$(printf '%s' "$1" | jq -cS .)"
+  code="$(printf '%s' "$desc" | sha256 | cut -c1-12)"
+  [ -n "$2" ] && [ "$2" = "$code" ] && return 0
+  [ -z "$2" ] || printf 'designerbox: --confirm %s does not match this operation (it changed since the preview)\n' "$2" >&2
+  printf 'PREVIEW (nothing was sent):\n'
+  printf '%s\n' "$desc" | jq .
+  printf 'Show this to the user (for generate/edit, with the cost from: designerbox models). Only after they approve exactly this, run the same command again with: --confirm %s\n' "$code"
+  exit 3
+}
+
+# file_fingerprint FILE -> sha256 of the bytes, so a confirmed upload cannot be swapped for another file
+file_fingerprint() { sha256 < "$1"; }
+
 # api METHOD PATH [json-body]  -> stdout: body; on HTTP>=400 prints a human error and exits 1
 api() {
   local method="$1" path="$2" body="${3:-}"
@@ -168,15 +191,29 @@ cmd_conversations() {
 }
 
 # ---- writes (these create assets; generate/edit spend credits) ---------------
-# upload FILE -> prints the new asset as {id, url}
-cmd_upload() {
-  local file="${1:-}"; [ -n "$file" ] || die "usage: designerbox upload <file>"
+# check_upload_file FILE -> dies unless FILE is an uploadable image/video with a curl-safe name
+check_upload_file() {
+  local file="$1"
   [ -f "$file" ] || die "no such file: $file"
-  local mime; mime="$(mime_for "$file")"
-  [ -n "$mime" ] || die "refusing to upload '$file': only image and video files (jpg jpeg png webp gif mp4 webm mov)"
+  [ -n "$(mime_for "$file")" ] || die "refusing to upload '$file': only image and video files (jpg jpeg png webp gif mp4 webm mov)"
   # curl -F splits its value on ; and reads quotes/backslashes, so "a.txt;x.png" would upload a.txt
   case "$file" in *[\;,\"\\]*|*$'\n'*|*$'\r'*) die "refusing to upload '$file': rename it without ; , \" or \\ characters";; esac
+}
+
+# upload FILE [--confirm CODE] -> prints the new asset as {id, url}
+cmd_upload() {
+  local file="${1:-}" confirm=""; [ -n "$file" ] || die "usage: designerbox upload <file> [--confirm CODE]"; shift
+  while [ $# -gt 0 ]; do case "$1" in --confirm) confirm="${2:-}"; shift 2 || die "--confirm needs a value";; *) die "unknown flag: $1";; esac; done
+  check_upload_file "$file"
   require_key
+  gate "$(jq -n --arg f "$file" --arg h "$(file_fingerprint "$file")" '{op:"upload", file:$f, sha256:$h}')" "$confirm"
+  do_upload "$file"
+}
+
+# do_upload FILE -> the upload itself. Not a command: only cmd_upload and cmd_edit call it,
+# and both do so after gate() has matched the user's --confirm code.
+do_upload() {
+  local file="$1" mime; mime="$(mime_for "$file")"
   local tmp code
   tmp="$(mktemp)"
   code="$(kcurl -sS -o "$tmp" -w '%{http_code}' -X POST "$BASE/assets/upload/single" \
@@ -185,19 +222,22 @@ cmd_upload() {
   jq '.asset | {id: ._id, url: .viewUrl}' "$tmp"; rm -f "$tmp"
 }
 
-# upload-url URL -> the DesignerBox server downloads a public https image into the library
+# upload-url URL [--confirm CODE] -> the DesignerBox server downloads a public https image into the library
 cmd_upload_url() {
-  local url="${1:-}"; [ -n "$url" ] || die "usage: designerbox upload-url <https-url>"
+  local url="${1:-}" confirm=""; [ -n "$url" ] || die "usage: designerbox upload-url <https-url> [--confirm CODE]"; shift
+  while [ $# -gt 0 ]; do case "$1" in --confirm) confirm="${2:-}"; shift 2 || die "--confirm needs a value";; *) die "unknown flag: $1";; esac; done
   valid_https "$url"; require_key
+  gate "$(jq -n --arg u "$url" '{op:"upload-url", url:$u}')" "$confirm"
   api POST /assets/upload/url "$(jq -n --arg u "$url" '{imageUrl:$u}')" | jq '.asset | {id: ._id, url: .viewUrl}'
 }
 
 print_images() { jq '.data | {images: [.images[]? | {id, url}], message}'; }
 
 cmd_generate() {
-  local prompt="" model="" aspect="" count=1 seed=""
+  local prompt="" model="" aspect="" count=1 seed="" confirm=""
   while [ $# -gt 0 ]; do
     case "$1" in
+      --confirm) confirm="${2:-}"; shift 2 || die "--confirm needs a value";;
       --prompt) prompt="${2:-}"; shift 2 || die "--prompt needs a value";;
       --model)  model="${2:-}";  shift 2 || die "--model needs a value";;
       --aspect) aspect="${2:-}"; shift 2 || die "--aspect needs a value";;
@@ -218,6 +258,7 @@ cmd_generate() {
     + (if $m=="" then {} else {model:$m} end)
     + (if $a=="" then {} else {aspectRatio:$a} end)
     + (if $s=="" then {} else {seed:($s|tonumber)} end)')"
+  gate "$(jq -c '{op:"generate"} + .' <<<"$body")" "$confirm"
   api POST /ai/generate-image "$body" | print_images
 }
 
@@ -231,16 +272,17 @@ resolve_ref() {
   elif [[ "$src" == https://* ]]; then
     printf '%s\n' "$src"
   elif [ -f "$src" ]; then
-    cmd_upload "$src" | jq -r '.url'
+    do_upload "$src" | jq -r '.url'
   else
     die "--ref must be an asset id, an https URL or an existing image file (got: $src)"
   fi
 }
 
 cmd_edit() {
-  local prompt="" model="" mode="" count=1 refs=()
+  local prompt="" model="" mode="" count=1 refs=() confirm=""
   while [ $# -gt 0 ]; do
     case "$1" in
+      --confirm) confirm="${2:-}"; shift 2 || die "--confirm needs a value";;
       --prompt) prompt="${2:-}"; shift 2 || die "--prompt needs a value";;
       --ref)    refs+=("${2:-}"); shift 2 || die "--ref needs a value";;
       --model)  model="${2:-}";  shift 2 || die "--model needs a value";;
@@ -259,10 +301,21 @@ cmd_edit() {
   local r
   for r in "${refs[@]}"; do
     if [[ "$r" =~ ^[0-9a-f]{24}$ ]] || [[ "$r" == https://* ]]; then :
-    elif [ -f "$r" ]; then case "$(mime_for "$r")" in image/*) ;; *) die "refusing --ref '$r': only image files";; esac
+    elif [ -f "$r" ]; then case "$(mime_for "$r")" in image/*) ;; *) die "refusing --ref '$r': only image files";; esac; check_upload_file "$r"
     else die "--ref must be an asset id, an https URL or an existing image file (got: $r)"; fi
   done
   require_key
+  # the user approves the references as given (local files by content hash), before any upload or lookup
+  local refs_json="[]"
+  for r in "${refs[@]}"; do
+    if [ -f "$r" ] && ! [[ "$r" =~ ^[0-9a-f]{24}$ ]]; then
+      refs_json="$(jq -c --arg f "$r" --arg h "$(file_fingerprint "$r")" '. + [{file:$f, sha256:$h}]' <<<"$refs_json")"
+    else
+      refs_json="$(jq -c --arg s "$r" '. + [{ref:$s}]' <<<"$refs_json")"
+    fi
+  done
+  gate "$(jq -n --arg p "$prompt" --arg m "$model" --arg e "$mode" --argjson n "$count" --argjson refs "$refs_json" \
+    '{op:"edit", prompt:$p, model:$m, editMode:$e, numberResults:$n, references:$refs}')" "$confirm"
   local urls=() u
   for r in "${refs[@]}"; do
     u="$(resolve_ref "$r")"; valid_https "$u"; urls+=("$u")
@@ -289,9 +342,10 @@ Reads (no credits):
   folders                       folder tree
   conversations [--page N] [--limit N]
 
-Writes (confirm with the user first):
-  upload <file>                 add an image/video to the library (uses storage)
-  upload-url <https-url>        server downloads a public image into the library
+Writes (each prints a PREVIEW and sends nothing; after the user approves it,
+run the same command again with --confirm <code from the preview>):
+  upload <file> [--confirm CODE]          add an image/video to the library (uses storage)
+  upload-url <https-url> [--confirm CODE] server downloads a public image into the library
   generate --prompt "..." [--model ID] [--aspect 16:9] [--count 1-10] [--seed N]      SPENDS CREDITS
   edit --prompt "..." --ref <assetId|https-url|file> [--ref ...] [--model ID] [--mode M] [--count 1-10]   SPENDS CREDITS
 

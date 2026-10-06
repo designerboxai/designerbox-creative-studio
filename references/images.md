@@ -1,6 +1,6 @@
 # Images: models, generate, edit
 
-> Safety: `generate-image` and `edit-image` spend AI credits. Confirm the model, count and cost with the user before each call.
+> Safety: `generate-image` and `edit-image` spend AI credits. Show the user the prompt, model, count, references and cost, and wait for their explicit yes before each call. The `designerbox` helper enforces this with a preview and a `--confirm` code; with raw curl it is on you.
 
 ```bash
 BASE=https://api-app.designerbox.ai/api/v1
