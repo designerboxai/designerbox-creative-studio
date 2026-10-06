@@ -1,0 +1,305 @@
+#!/usr/bin/env bash
+# designerbox - thin CLI over the DesignerBox REST API (https://api-app.designerbox.ai/api/v1)
+#
+# Auth:  export DESIGNERBOX_API_KEY=<your key from https://designerbox.ai/account/api-keys>
+# Needs: curl, jq
+#
+# What this helper absorbs so the agent does not have to:
+#   1. ids go into URL paths only after a strict shape check (asset ids are 24-hex ObjectIds)
+#   2. three error body shapes ({error:{message}}, {error:"..."}, bare {error}) become one line
+#   3. the {success,data} envelope is unwrapped only when present
+#   4. numberResults outside 1-10 is silently turned into 1 by the API; here it is refused
+#   5. uploads are images and video only; remote URLs must be https
+# See references/*.md for the raw curl equivalents (usable with no helper at all).
+
+set -euo pipefail
+
+BASE="https://api-app.designerbox.ai/api/v1"
+
+die()  { printf 'designerbox: %s\n' "$1" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
+
+# valid_asset_id VALUE -> dies unless VALUE is a 24-hex Mongo ObjectId (anything else 500s or rewrites the path)
+valid_asset_id() { [[ "$1" =~ ^[0-9a-f]{24}$ ]] || die "invalid asset id: $1 (expected 24 hex characters)"; }
+# valid_token VALUE -> dies unless VALUE is a plain token (model ids, edit modes)
+valid_token() { case "$1" in ''|*[!A-Za-z0-9._-]*) die "invalid value: $1";; esac; }
+# valid_int VALUE MIN MAX NAME
+valid_int() { [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge "$2" ] && [ "$1" -le "$3" ] || die "$4 must be an integer from $2 to $3 (got: $1)"; }
+# valid_https VALUE
+valid_https() { case "$1" in https://*) ;; *) die "refusing non-https URL: $1";; esac; }
+
+# mime_for FILE -> mime for image/video files, else empty
+mime_for() {
+  case "$(printf '%s' "${1##*.}" | tr '[:upper:]' '[:lower:]')" in
+    jpg|jpeg) echo image/jpeg;; png) echo image/png;; webp) echo image/webp;; gif) echo image/gif;;
+    mp4) echo video/mp4;; webm) echo video/webm;; mov) echo video/quicktime;; *) echo "";;
+  esac
+}
+
+require_key() { [ -n "${DESIGNERBOX_API_KEY:-}" ] || die "set DESIGNERBOX_API_KEY (create one at https://designerbox.ai/account/api-keys)"; }
+
+# api METHOD PATH [json-body]  -> stdout: body; on HTTP>=400 prints a human error and exits 1
+api() {
+  local method="$1" path="$2" body="${3:-}"
+  local tmp code
+  tmp="$(mktemp)"
+  if [ -n "$body" ]; then
+    code="$(curl -sS -o "$tmp" -w '%{http_code}' -X "$method" "$BASE$path" \
+      -H "x-api-key: $DESIGNERBOX_API_KEY" -H 'Content-Type: application/json' -d "$body")" || { rm -f "$tmp"; die "request failed: $method $path"; }
+  else
+    code="$(curl -sS -o "$tmp" -w '%{http_code}' -X "$method" "$BASE$path" \
+      -H "x-api-key: $DESIGNERBOX_API_KEY")" || { rm -f "$tmp"; die "request failed: $method $path"; }
+  fi
+  check_status "$code" "$tmp"
+  cat "$tmp"; rm -f "$tmp"
+}
+
+# check_status CODE BODYFILE -> returns on <400, else prints one human line and exits 1
+check_status() {
+  local code="$1" tmp="$2"
+  [ "$code" -lt 400 ] && return 0
+  local msg errcode
+  msg="$(jq -r 'if type=="object" then ((.error|if type=="object" then .message elif type=="string" then . else empty end) // .message // "request failed") else "request failed" end' "$tmp" 2>/dev/null || echo "request failed")"
+  errcode="$(jq -r 'if type=="object" then (.code // .error.code // "") else "" end' "$tmp" 2>/dev/null || echo "")"
+  case "$errcode" in
+    SUBSCRIPTION_INACTIVE)       msg="subscription inactive - fix billing at designerbox.ai ($msg)";;
+    INSUFFICIENT_CREDITS)        msg="not enough AI credits for this request - check: designerbox usage ($msg)";;
+    MODEL_ACCESS_RESTRICTED)     msg="this model is not available on your plan - pick another: designerbox models ($msg)";;
+    PROHIBITED_USE_NOT_ACCEPTED) msg="the account has not accepted the DesignerBox Prohibited Use Policy - the account owner must accept it in the DesignerBox app, then retry ($msg)";;
+    RATE_LIMITED)                msg="rate limited - wait and retry ($msg)";;
+    *) case "$code" in
+         401) msg="invalid or missing API key ($msg)";;
+         402) msg="a paid DesignerBox plan is required ($msg)";;
+         429) msg="rate limited - wait and retry ($msg)";;
+       esac;;
+  esac
+  rm -f "$tmp"; die "HTTP $code: $msg"
+}
+
+# unwrap: read stdin, return .data if the {success,data} envelope is present, else the body as-is
+unwrap() { jq 'if type=="object" and has("data") then .data else . end'; }
+
+# ---- reads -----------------------------------------------------------------
+cmd_costs() {
+  # public endpoint, no key needed
+  curl -sS "$BASE/ai/credit-costs" | unwrap
+}
+
+cmd_models() {
+  require_key
+  api GET /ai/image-models | jq -r '.data.models[]
+    | "\(.id)\t\(.creditsPerImage) cr\t\(.capabilities|join(","))\(if .isDefault then "\tdefault" else "" end)\(if .supportedEditModes then "\tmodes=" + (.supportedEditModes|map(.id)|join(",")) else "" end)"'
+}
+
+cmd_usage() {
+  require_key
+  api GET /usage/limits | jq '.data | {subscriptionTier, isTrial, aiCredits, storageMB: .storage}'
+}
+
+cmd_assets() {
+  local kind="images" page=1 limit=20
+  case "${1:-}" in images|videos) kind="$1"; shift;; esac
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --page)  page="${2:-}";  shift 2 || die "--page needs a value";;
+      --limit) limit="${2:-}"; shift 2 || die "--limit needs a value";;
+      *) die "unknown flag: $1";;
+    esac
+  done
+  valid_int "$page" 1 100000 "--page"; valid_int "$limit" 1 100 "--limit"
+  require_key
+  # images page by ?page and answer {meta}; videos page by ?skip and answer {pagination} - normalise both
+  local q="page=$page&limit=$limit"
+  [ "$kind" = images ] || q="skip=$(( (page-1)*limit ))&limit=$limit"
+  api GET "/assets/$kind?$q" | jq --argjson page "$page" --argjson limit "$limit" '
+    {meta: (if .meta then {page: .meta.page, limit: .meta.limit, total: .meta.total, hasNextPage: .meta.hasNextPage}
+            else {page: $page, limit: $limit, total: .pagination.total, hasNextPage: .pagination.hasMore} end),
+     assets: [.data[] | {id: ._id, name: (.displayName // .originalName), type, width, height, createdAt}]}'
+}
+
+cmd_asset() {
+  local id="${1:-}"; [ -n "$id" ] || die "usage: designerbox asset <assetId>"
+  valid_asset_id "$id"; require_key
+  api GET "/assets/$id" | jq '.data | {id: ._id, name: (.displayName // .originalName), type, size, width, height, prompt, modelName, folderId, viewUrl, createdAt}'
+}
+
+cmd_download() {
+  local id="${1:-}" out="${2:-}"; [ -n "$id" ] || die "usage: designerbox download <assetId> [outfile]"
+  valid_asset_id "$id"
+  [ -z "$out" ] || [ ! -e "$out" ] || die "refusing to overwrite existing file: $out"
+  require_key
+  local meta url ext
+  meta="$(api GET "/assets/$id")"
+  url="$(printf '%s' "$meta" | jq -r '.data.viewUrl // empty')"
+  [ -n "$url" ] || die "asset $id has no viewUrl"
+  valid_https "$url"
+  if [ -z "$out" ]; then
+    ext="$(printf '%s' "$meta" | jq -r '.data.type // "" | split("/")[1] // "bin"' | sed 's/jpeg/jpg/; s/quicktime/mov/')"
+    out="$id.$ext"
+    [ ! -e "$out" ] || die "refusing to overwrite existing file: $out"
+  fi
+  curl -sSfL --proto '=https' --proto-redir '=https' -o "$out" "$url" || { rm -f "$out"; die "download failed"; }
+  printf '%s\n' "$out"
+}
+
+cmd_folders()       { require_key; api GET /folders/tree | unwrap; }
+cmd_conversations() {
+  local page=1 limit=20
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --page)  page="${2:-}";  shift 2 || die "--page needs a value";;
+      --limit) limit="${2:-}"; shift 2 || die "--limit needs a value";;
+      *) die "unknown flag: $1";;
+    esac
+  done
+  valid_int "$page" 1 100000 "--page"; valid_int "$limit" 1 100 "--limit"
+  require_key; api GET "/conversations?page=$page&limit=$limit" | unwrap
+}
+
+# ---- writes (these create assets; generate/edit spend credits) ---------------
+# upload FILE -> prints the new asset as {id, url}
+cmd_upload() {
+  local file="${1:-}"; [ -n "$file" ] || die "usage: designerbox upload <file>"
+  [ -f "$file" ] || die "no such file: $file"
+  local mime; mime="$(mime_for "$file")"
+  [ -n "$mime" ] || die "refusing to upload '$file': only image and video files (jpg jpeg png webp gif mp4 webm mov)"
+  require_key
+  local tmp code
+  tmp="$(mktemp)"
+  code="$(curl -sS -o "$tmp" -w '%{http_code}' -X POST "$BASE/assets/upload/single" \
+    -H "x-api-key: $DESIGNERBOX_API_KEY" -F "file=@$file;type=$mime")" || { rm -f "$tmp"; die "upload request failed"; }
+  check_status "$code" "$tmp"
+  jq '.asset | {id: ._id, url: .viewUrl}' "$tmp"; rm -f "$tmp"
+}
+
+# upload-url URL -> the DesignerBox server downloads a public https image into the library
+cmd_upload_url() {
+  local url="${1:-}"; [ -n "$url" ] || die "usage: designerbox upload-url <https-url>"
+  valid_https "$url"; require_key
+  api POST /assets/upload/url "$(jq -n --arg u "$url" '{imageUrl:$u}')" | jq '.asset | {id: ._id, url: .viewUrl}'
+}
+
+print_images() { jq '.data | {images: [.images[]? | {id, url}], message}'; }
+
+cmd_generate() {
+  local prompt="" model="" aspect="" count=1 seed=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --prompt) prompt="${2:-}"; shift 2 || die "--prompt needs a value";;
+      --model)  model="${2:-}";  shift 2 || die "--model needs a value";;
+      --aspect) aspect="${2:-}"; shift 2 || die "--aspect needs a value";;
+      --count)  count="${2:-}";  shift 2 || die "--count needs a value";;
+      --seed)   seed="${2:-}";   shift 2 || die "--seed needs a value";;
+      *) die "unknown flag: $1";;
+    esac
+  done
+  [ -n "$prompt" ] || die "--prompt is required"
+  valid_int "$count" 1 10 "--count"
+  [ -z "$model" ] || valid_token "$model"
+  [ -z "$aspect" ] || [[ "$aspect" =~ ^[0-9]{1,2}:[0-9]{1,2}$ ]] || die "--aspect must look like 16:9 (got: $aspect)"
+  [ -z "$seed" ] || [[ "$seed" =~ ^[0-9]+$ ]] || die "--seed must be a non-negative integer"
+  require_key
+  local body
+  body="$(jq -n --arg p "$prompt" --arg m "$model" --arg a "$aspect" --argjson n "$count" --arg s "$seed" '
+    {prompt:$p, numberResults:$n}
+    + (if $m=="" then {} else {model:$m} end)
+    + (if $a=="" then {} else {aspectRatio:$a} end)
+    + (if $s=="" then {} else {seed:($s|tonumber)} end)')"
+  api POST /ai/generate-image "$body" | print_images
+}
+
+# resolve_ref SRC -> an https image URL the server can fetch (asset id, https URL, or local file uploaded first)
+resolve_ref() {
+  local src="$1"
+  if [[ "$src" =~ ^[0-9a-f]{24}$ ]]; then
+    api GET "/assets/$src" | jq -r '.data.viewUrl // .data.url'
+  elif [[ "$src" == https://* ]]; then
+    printf '%s\n' "$src"
+  elif [ -f "$src" ]; then
+    cmd_upload "$src" | jq -r '.url'
+  else
+    die "--ref must be an asset id, an https URL or an existing image file (got: $src)"
+  fi
+}
+
+cmd_edit() {
+  local prompt="" model="" mode="" count=1 refs=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --prompt) prompt="${2:-}"; shift 2 || die "--prompt needs a value";;
+      --ref)    refs+=("${2:-}"); shift 2 || die "--ref needs a value";;
+      --model)  model="${2:-}";  shift 2 || die "--model needs a value";;
+      --mode)   mode="${2:-}";   shift 2 || die "--mode needs a value";;
+      --count)  count="${2:-}";  shift 2 || die "--count needs a value";;
+      *) die "unknown flag: $1";;
+    esac
+  done
+  [ -n "$prompt" ] || die "--prompt is required"
+  [ "${#refs[@]}" -gt 0 ] || die "at least one --ref is required"
+  [ "${#refs[@]}" -le 10 ] || die "at most 10 --ref images"
+  valid_int "$count" 1 10 "--count"
+  [ -z "$model" ] || valid_token "$model"
+  [ -z "$mode" ] || valid_token "$mode"
+  # validate every ref's shape before any request (a local file is only uploaded once all refs pass)
+  local r
+  for r in "${refs[@]}"; do
+    if [[ "$r" =~ ^[0-9a-f]{24}$ ]] || [[ "$r" == https://* ]]; then :
+    elif [ -f "$r" ]; then [ -n "$(mime_for "$r")" ] || die "refusing --ref '$r': only image files"
+    else die "--ref must be an asset id, an https URL or an existing image file (got: $r)"; fi
+  done
+  require_key
+  local urls=() u
+  for r in "${refs[@]}"; do
+    u="$(resolve_ref "$r")"; valid_https "$u"; urls+=("$u")
+  done
+  local body
+  body="$(printf '%s\n' "${urls[@]}" | jq -R . | jq -s --arg p "$prompt" --arg m "$model" --arg e "$mode" --argjson n "$count" '
+    {prompt:$p, numberResults:$n, referenceImages: map({imageUrl:., type:"raw"})}
+    + (if $m=="" then {} else {model:$m} end)
+    + (if $e=="" then {} else {editMode:$e} end)')"
+  api POST /ai/edit-image "$body" | print_images
+}
+
+usage() {
+  cat >&2 <<'EOF'
+designerbox <command>
+
+Reads (no credits):
+  costs                         credit price list (public, no key needed)
+  models                        image models: id, credits per image, capabilities, edit modes
+  usage                         plan, AI credits used/limit, storage used/limit
+  assets [images|videos] [--page N] [--limit N<=100]
+  asset <assetId>               one asset's details, including its viewUrl
+  download <assetId> [outfile]  save the asset file (never overwrites)
+  folders                       folder tree
+  conversations [--page N] [--limit N]
+
+Writes (confirm with the user first):
+  upload <file>                 add an image/video to the library (uses storage)
+  upload-url <https-url>        server downloads a public image into the library
+  generate --prompt "..." [--model ID] [--aspect 16:9] [--count 1-10] [--seed N]      SPENDS CREDITS
+  edit --prompt "..." --ref <assetId|https-url|file> [--ref ...] [--model ID] [--mode M] [--count 1-10]   SPENDS CREDITS
+
+Env: DESIGNERBOX_API_KEY (required except for costs)
+EOF
+  exit 1
+}
+
+need curl; need jq
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  costs)         cmd_costs "$@";;
+  models)        cmd_models "$@";;
+  usage)         cmd_usage "$@";;
+  assets)        cmd_assets "$@";;
+  asset)         cmd_asset "$@";;
+  download)      cmd_download "$@";;
+  folders)       cmd_folders "$@";;
+  conversations) cmd_conversations "$@";;
+  upload)        cmd_upload "$@";;
+  upload-url)    cmd_upload_url "$@";;
+  generate)      cmd_generate "$@";;
+  edit)          cmd_edit "$@";;
+  ''|-h|--help|help) usage;;
+  *) die "unknown command: $cmd (try: designerbox help)";;
+esac
