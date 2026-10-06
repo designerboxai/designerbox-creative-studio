@@ -24,19 +24,19 @@ Two ways to use this skill:
 
 ## The core loop
 
-1. **Check the budget**: `designerbox usage` (credits used and limit) and `designerbox models` (credits per image for each model).
-2. **Generate**: `designerbox generate --prompt "..." [--model nano-banana-2] [--aspect 16:9] [--count 1]`. Prints the new images' asset ids and URLs.
-3. **Edit** an existing image: `designerbox edit --prompt "..." --ref <assetId|https-url|file> [--mode bgswap]`.
-4. **Use the result**: `designerbox asset <id>` for details, `designerbox download <id> out.jpg` to save it locally.
+1. **Check the budget**: `./designerbox usage` (credits used and limit) and `./designerbox models` (credits per image for each model).
+2. **Generate**: `./designerbox generate --prompt "..." [--model nano-banana-2] [--aspect 16:9] [--count 1]`. Prints the new images' asset ids and URLs.
+3. **Edit** an existing image: `./designerbox edit --prompt "..." --ref <assetId|https-url|image-file> [--mode bgswap]`. A local image file is uploaded to the library first.
+4. **Use the result**: `./designerbox asset <id>` for details, `./designerbox download <id> out.jpg` to save it locally.
 
 Every generated or edited image is saved to the user's library automatically.
 
 ## Safety
 
-- **Generation and editing spend real AI credits** on the user's account. Before every `generate` or `edit`, tell the user the model, the image count and the cost (`creditsPerImage` x count from `designerbox models`) and get a yes.
-- **Uploads add files to the user's library and use storage.** Upload only files the user asked to add. The helper accepts images and video only, and `upload-url` and edit references must be https.
+- **Generation and editing spend real AI credits** on the user's account. Before every `generate` or `edit`, tell the user the model, the image count and the cost (`creditsPerImage` x count from `./designerbox models`) and get a yes.
+- **Uploads add files to the user's library and use storage.** Upload only files the user asked to add. A local file passed to `edit --ref` is uploaded to the library first and stays there, even if the edit then fails. The helper accepts images and video only, and `upload-url` and edit references must be https.
 - The API key acts on the user's real account. Use a dedicated key, and never paste it into prompts, logs, URLs or files.
-- The helper only talks to `https://api-app.designerbox.ai`. Do not send the key to any other host.
+- The helper sends the key only to `https://api-app.designerbox.ai`. `download` fetches the asset's public https `viewUrl` without the key. Do not send the key to any other host.
 - This skill never deletes anything.
 
 ## Traps the helper absorbs (handle them yourself with raw curl)

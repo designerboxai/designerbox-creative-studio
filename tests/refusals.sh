@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Every refusal path of the helper, run for real. A fake curl on PATH records any call,
 # so each case also proves the refusal happened BEFORE a request was sent.
-# Usage: bash tests/refusals.sh   (no network, no key needed)
+# Usage: bash tests/refusals.sh   (no network, no key needed; DBX_BASH=/bin/bash runs the helper under bash 3.2)
 set -u
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 DBX="$HERE/designerbox"
@@ -20,6 +20,8 @@ printf 'x' > "$WORK/pic.png"
 printf 'x' > "$WORK/exists.jpg"
 printf 'not an image' > "$WORK/evil.txt"
 printf 'x' > "$WORK/evil.txt;x.png"
+printf 'x' > "$WORK/clip.mp4"
+ln -s "$WORK/elsewhere.jpg" "$WORK/dangling.jpg"
 
 pass=0; fail=0
 # expect_refusal NAME EXPECTED_STDERR_SUBSTRING [env KEY=VAL ...] -- ARGS...
@@ -29,7 +31,7 @@ expect_refusal() {
   while [ "$1" != "--" ]; do envs+=("$1"); shift; done; shift
   : > "$CURL_LOG"
   local err rc
-  err="$(cd "$WORK" && env "${envs[@]}" bash "$DBX" "$@" 2>&1 >/dev/null)"; rc=$?
+  err="$(cd "$WORK" && env "${envs[@]}" "${DBX_BASH:-bash}" "$DBX" "$@" 2>&1 >/dev/null)"; rc=$?
   if [ "$rc" -ne 0 ] && [[ "$err" == *"$want"* ]] && [ ! -s "$CURL_LOG" ]; then
     pass=$((pass+1)); printf 'ok   %s\n' "$name"
   else
@@ -48,6 +50,8 @@ expect_refusal "asset id uppercase hex"      "invalid asset id"          "$K" --
 expect_refusal "asset id 23 chars"           "invalid asset id"          "$K" -- asset 6a632e774973bcb3a23d6c3
 expect_refusal "download bad id"             "invalid asset id"          "$K" -- download nope
 expect_refusal "download no overwrite"       "refusing to overwrite"     "$K" -- download 6a632e774973bcb3a23d6c3e exists.jpg
+expect_refusal "download dangling symlink"    "refusing to overwrite"     "$K" -- download 6a632e774973bcb3a23d6c3e dangling.jpg
+expect_refusal "download to -"               "starting with -"           "$K" -- download 6a632e774973bcb3a23d6c3e -
 expect_refusal "assets limit over 100"       "--limit must be"           "$K" -- assets --limit 101
 expect_refusal "assets page not int"         "--page must be"            "$K" -- assets --page 1abc
 expect_refusal "assets page leading zero"    "--page must be"            "$K" -- assets videos --page 08
@@ -68,16 +72,24 @@ expect_refusal "generate flag no value"      "--prompt needs a value"    "$K" --
 expect_refusal "edit no ref"                 "at least one --ref"        "$K" -- edit --prompt hi
 expect_refusal "edit http ref"               "--ref must be"             "$K" -- edit --prompt hi --ref http://example.com/a.png
 expect_refusal "edit non-image file ref"     "only image files"          "$K" -- edit --prompt hi --ref notes.txt
+expect_refusal "edit video file ref"         "only image files"          "$K" -- edit --prompt hi --ref clip.mp4
 expect_refusal "edit bad mode"               "invalid value"             "$K" -- edit --prompt hi --ref pic.png --mode "x y"
 expect_refusal "edit 11 refs"                "at most 10"                "$K" -- edit --prompt hi $(for i in 1 2 3 4 5 6 7 8 9 10 11; do printf -- '--ref pic.png '; done)
 expect_refusal "edit good+bad ref, no upload" "--ref must be"            "$K" -- edit --prompt hi --ref pic.png --ref nope
 
 # the key must never be a curl argument (argv is visible to every local user via ps)
 : > "$CURL_LOG"
-(cd "$WORK" && env "$K" bash "$DBX" usage >/dev/null 2>&1)
+(cd "$WORK" && env "$K" "${DBX_BASH:-bash}" "$DBX" usage >/dev/null 2>&1)
 if [ -s "$CURL_LOG" ] && ! grep -q "apikey_00000000" "$CURL_LOG" && grep -q -- "-H @-" "$CURL_LOG"; then
   pass=$((pass+1)); echo "ok   key not in curl argv"
 else fail=$((fail+1)); echo "FAIL key not in curl argv: $(cat "$CURL_LOG")"; fi
+
+# every curl must start with -q so a user's ~/.curlrc (verbose, location-trusted) cannot print or forward the key
+: > "$CURL_LOG"
+(cd "$WORK" && env "$K" "${DBX_BASH:-bash}" "$DBX" usage >/dev/null 2>&1; env "$K" "${DBX_BASH:-bash}" "$DBX" costs >/dev/null 2>&1)
+if [ "$(wc -l < "$CURL_LOG" | tr -d ' ')" -ge 2 ] && ! grep -qv '^-q ' "$CURL_LOG"; then
+  pass=$((pass+1)); echo "ok   curl always called with -q first"
+else fail=$((fail+1)); echo "FAIL curl -q first: $(cat "$CURL_LOG")"; fi
 
 # base URL is hardcoded: no env var can redirect the key to another host
 if grep -nE 'BASE=.*\$' "$DBX" >/dev/null; then fail=$((fail+1)); echo "FAIL base URL is overridable"; else pass=$((pass+1)); echo "ok   base URL hardcoded"; fi

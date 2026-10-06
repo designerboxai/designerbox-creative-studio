@@ -41,8 +41,9 @@ require_key() {
   [[ "$DESIGNERBOX_API_KEY" =~ ^apikey_[A-Za-z0-9-]+$ ]] || die "DESIGNERBOX_API_KEY does not look like a DesignerBox key (apikey_...)"
 }
 
-# kcurl ARGS... -> curl with the key header fed on stdin, so the key never appears in the process list
-kcurl() { curl -H @- "$@" <<<"x-api-key: $DESIGNERBOX_API_KEY"; }
+# kcurl ARGS... -> curl with the key header fed on stdin, so the key never appears in the process list.
+# -q (must be first) skips ~/.curlrc, where "verbose" would print the key and "location-trusted" would forward it.
+kcurl() { curl -q -H @- "$@" <<<"x-api-key: $DESIGNERBOX_API_KEY"; }
 
 # api METHOD PATH [json-body]  -> stdout: body; on HTTP>=400 prints a human error and exits 1
 api() {
@@ -62,7 +63,7 @@ api() {
 # check_status CODE BODYFILE -> returns on <400, else prints one human line and exits 1
 check_status() {
   local code="$1" tmp="$2"
-  [ "$code" -lt 400 ] && return 0
+  [ "$code" -ge 200 ] && [ "$code" -lt 300 ] && return 0
   local msg errcode
   msg="$(jq -r 'if type=="object" then ((.error|if type=="object" then .message elif type=="string" then . else empty end) // .message // "request failed") else "request failed" end' "$tmp" 2>/dev/null || echo "request failed")"
   errcode="$(jq -r 'if type=="object" then (.code // .error.code // "") else "" end' "$tmp" 2>/dev/null || echo "")"
@@ -87,7 +88,11 @@ unwrap() { jq 'if type=="object" and has("data") then .data else . end'; }
 # ---- reads -----------------------------------------------------------------
 cmd_costs() {
   # public endpoint, no key needed
-  curl -sS "$BASE/ai/credit-costs" | unwrap
+  local tmp code
+  tmp="$(mktemp)"
+  code="$(curl -q -sS -o "$tmp" -w '%{http_code}' "$BASE/ai/credit-costs")" || { rm -f "$tmp"; die "request failed: GET /ai/credit-costs"; }
+  check_status "$code" "$tmp"
+  unwrap < "$tmp"; rm -f "$tmp"
 }
 
 cmd_models() {
@@ -131,7 +136,8 @@ cmd_asset() {
 cmd_download() {
   local id="${1:-}" out="${2:-}"; [ -n "$id" ] || die "usage: designerbox download <assetId> [outfile]"
   valid_asset_id "$id"
-  [ -z "$out" ] || [ ! -e "$out" ] || die "refusing to overwrite existing file: $out"
+  case "$out" in -*) die "refusing output name starting with -: $out";; esac
+  [ -z "$out" ] || { [ ! -e "$out" ] && [ ! -L "$out" ]; } || die "refusing to overwrite existing file: $out"
   require_key
   local meta url ext
   meta="$(api GET "/assets/$id")"
@@ -141,9 +147,9 @@ cmd_download() {
   if [ -z "$out" ]; then
     ext="$(printf '%s' "$meta" | jq -r '.data.type // "" | split("/")[1] // "bin"' | sed 's/jpeg/jpg/; s/quicktime/mov/')"
     out="$id.$ext"
-    [ ! -e "$out" ] || die "refusing to overwrite existing file: $out"
+    { [ ! -e "$out" ] && [ ! -L "$out" ]; } || die "refusing to overwrite existing file: $out"
   fi
-  curl -sSfL --proto '=https' --proto-redir '=https' -o "$out" "$url" || { rm -f "$out"; die "download failed"; }
+  curl -q -sSfL --proto '=https' --proto-redir '=https' -o "$out" "$url" || { rm -f "$out"; die "download failed"; }
   printf '%s\n' "$out"
 }
 
@@ -219,7 +225,9 @@ cmd_generate() {
 resolve_ref() {
   local src="$1"
   if [[ "$src" =~ ^[0-9a-f]{24}$ ]]; then
-    api GET "/assets/$src" | jq -r '.data.viewUrl // .data.url'
+    local u; u="$(api GET "/assets/$src" | jq -r '.data.viewUrl // .data.url // empty')"
+    [ -n "$u" ] || die "asset $src has no viewUrl"
+    printf '%s\n' "$u"
   elif [[ "$src" == https://* ]]; then
     printf '%s\n' "$src"
   elif [ -f "$src" ]; then
@@ -251,7 +259,7 @@ cmd_edit() {
   local r
   for r in "${refs[@]}"; do
     if [[ "$r" =~ ^[0-9a-f]{24}$ ]] || [[ "$r" == https://* ]]; then :
-    elif [ -f "$r" ]; then [ -n "$(mime_for "$r")" ] || die "refusing --ref '$r': only image files"
+    elif [ -f "$r" ]; then case "$(mime_for "$r")" in image/*) ;; *) die "refusing --ref '$r': only image files";; esac
     else die "--ref must be an asset id, an https URL or an existing image file (got: $r)"; fi
   done
   require_key

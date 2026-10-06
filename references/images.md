@@ -44,7 +44,7 @@ Response: `{success, data:{images:[{id, url, ...}], message, metadata}}`. Each i
 curl -sS -X POST $BASE/ai/edit-image \
   -H "x-api-key: $DESIGNERBOX_API_KEY" -H 'Content-Type: application/json' \
   -d '{"prompt":"replace the background with a marble kitchen counter","model":"nano-banana-2","editMode":"bgswap","numberResults":1,
-       "referenceImages":[{"imageUrl":"https://d1jvbmo0p8k2km.cloudfront.net/<file>.jpg","type":"raw"}]}'
+       "referenceImages":[{"imageUrl":"<the asset viewUrl, https>","type":"raw"}]}'
 ```
 
 Body: `prompt` (required), `referenceImages` (required, non-empty), `model`, `editMode`, `numberResults`.
